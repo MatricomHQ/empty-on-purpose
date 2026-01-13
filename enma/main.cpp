@@ -6,47 +6,65 @@
 #include <unordered_map>
 #include <algorithm>
 #include <random>
+#include <cctype>
+#include <set>
 
-// Simple tokenizer: split by space, remove punctuation
-std::vector<std::string> tokenize(const std::string& text) {
-    std::vector<std::string> tokens;
-    std::string current;
-    for (char c : text) {
-        if (std::isalpha(c)) {
-            current += std::tolower(c);
-        } else if (!current.empty()) {
-            tokens.push_back(current);
-            current = "";
+// Robust tokenizer
+std::vector<std::vector<std::string>> load_phrases(const std::string& filename) {
+    std::vector<std::vector<std::string>> phrases;
+    std::ifstream file(filename);
+    if (!file.is_open()) return phrases;
+
+    std::string line;
+    while (std::getline(file, line)) {
+        std::vector<std::string> tokens;
+        std::string current;
+        for (char c : line) {
+            if (std::isalpha(c)) {
+                current += std::tolower(c);
+            } else if (!current.empty()) {
+                tokens.push_back(current);
+                current = "";
+            }
         }
+        if (!current.empty()) tokens.push_back(current);
+        if (!tokens.empty()) phrases.push_back(tokens);
     }
-    if (!current.empty()) tokens.push_back(current);
-    return tokens;
+    return phrases;
 }
 
 int main() {
     std::cout << "Initializing ENMA (Elastic Neuro-Mesh Architecture)..." << std::endl;
 
     // 1. Load Data
-    std::ifstream file("training_data.txt");
-    if (!file.is_open()) {
-        std::cerr << "Could not open training_data.txt" << std::endl;
-        return 1;
-    }
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    std::vector<std::string> tokens = tokenize(buffer.str());
+    auto phrases = load_phrases("training_data.txt");
 
-    if (tokens.empty()) {
-        std::cerr << "No tokens found." << std::endl;
+    if (phrases.empty()) {
+        std::cerr << "No phrases found." << std::endl;
         return 1;
     }
 
-    std::cout << "Loaded " << tokens.size() << " tokens." << std::endl;
+    size_t total_tokens = 0;
+    for (const auto& p : phrases) total_tokens += p.size();
+    std::cout << "Loaded " << phrases.size() << " phrases with " << total_tokens << " tokens." << std::endl;
 
     // 2. Setup Network
-    Network net(2000);
     std::unordered_map<std::string, size_t> word_to_neuron;
     std::vector<std::string> neuron_to_word;
+
+    // Build vocab
+    for (const auto& phrase : phrases) {
+        for (const auto& word : phrase) {
+            if (word_to_neuron.find(word) == word_to_neuron.end()) {
+                word_to_neuron[word] = 0;
+            }
+        }
+    }
+    size_t vocab_size = word_to_neuron.size();
+    std::cout << "Vocabulary size: " << vocab_size << std::endl;
+
+    Network net(vocab_size + 100);
+    word_to_neuron.clear();
 
     auto get_or_create_neuron = [&](const std::string& word) {
         if (word_to_neuron.find(word) == word_to_neuron.end()) {
@@ -61,12 +79,11 @@ int main() {
             n.on_fire = [&net, idx](Neuron* self) {
                 int64_t now = net.scheduler.get_current_time();
 
-                // 1. LTP (Long-Term Potentiation): Strengthen connections from neurons that fired recently
+                // 1. LTP
                 for (size_t src_idx : self->incoming_sources) {
                     Neuron& src = net.arena.get(src_idx);
                     int64_t dt = now - src.last_fire_time;
 
-                    // Window of 15 ticks (words are spaced by 10 ticks)
                     if (dt > 0 && dt <= 15) {
                         for (auto& syn : src.synapses) {
                             if (syn.target_neuron_index == idx) {
@@ -78,9 +95,7 @@ int main() {
                     }
                 }
 
-                // 2. LTD (Long-Term Depression): Weaken connections to neurons that fired BEFORE we fired (anti-causal)
-                // If I fire now, and target fired recently, it means target fired BEFORE me.
-                // So My firing did NOT cause Target. My connection to Target should be weak.
+                // 2. LTD
                 for (auto& syn : self->synapses) {
                     Neuron& target = net.arena.get(syn.target_neuron_index);
                     int64_t dt = now - target.last_fire_time;
@@ -98,31 +113,48 @@ int main() {
     };
 
     // Initialize neurons
-    for (const auto& t : tokens) {
-        get_or_create_neuron(t);
-    }
-
-    std::cout << "Vocabulary size: " << neuron_to_word.size() << std::endl;
-
-    // Connect all to all with 0 weight
-    for (size_t i = 0; i < neuron_to_word.size(); ++i) {
-        for (size_t j = 0; j < neuron_to_word.size(); ++j) {
-            if (i == j) continue;
-            net.connect(i, j, 0, 5);
+    for (const auto& phrase : phrases) {
+        for (const auto& word : phrase) {
+            get_or_create_neuron(word);
         }
     }
+
+    // SPARSE INITIALIZATION: Only connect words that appear nearby in the text.
+    std::cout << "Initializing sparse connections..." << std::endl;
+    std::set<std::pair<size_t, size_t>> connections;
+
+    for (const auto& phrase : phrases) {
+        for (size_t i = 0; i < phrase.size(); ++i) {
+            size_t src_idx = word_to_neuron[phrase[i]];
+            // Connect to next 3 words?
+            for (size_t j = i + 1; j < phrase.size() && j < i + 4; ++j) {
+                size_t tgt_idx = word_to_neuron[phrase[j]];
+                if (src_idx == tgt_idx) continue;
+
+                if (connections.find({src_idx, tgt_idx}) == connections.end()) {
+                    net.connect(src_idx, tgt_idx, 0, 5);
+                    connections.insert({src_idx, tgt_idx});
+                }
+            }
+        }
+    }
+    std::cout << "Created " << connections.size() << " connections." << std::endl;
 
     // 3. Training
     std::cout << "Training..." << std::endl;
-    int epochs = 20;
+    int epochs = 10; // 10 epochs should be enough
 
     for (int e = 0; e < epochs; ++e) {
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            size_t idx = word_to_neuron[tokens[i]];
-            net.stimulate(idx, 600); // Force fire
-            net.run(10); // Run simulation
+        if (e % 2 == 0) std::cout << "  Epoch " << e << std::endl;
+
+        for (const auto& phrase : phrases) {
+            for (const auto& word : phrase) {
+                size_t idx = word_to_neuron[word];
+                net.stimulate(idx, 600);
+                net.run(10);
+            }
+            net.run(50);
         }
-        net.run(100); // Cool down between epochs
     }
 
     std::cout << "Training complete." << std::endl;
@@ -143,21 +175,26 @@ int main() {
 
         std::cout << "Prediction for '" << word << "':" << std::endl;
         bool found = false;
+        int count = 0;
         for (int i=0; i < (int)sorted_synapses.size(); ++i) {
-            if (sorted_synapses[i].weight > 250) { // Threshold for strong association
+            if (sorted_synapses[i].weight > 200) {
                 std::string target = neuron_to_word[sorted_synapses[i].target_neuron_index];
                 std::cout << "  -> " << target << " (strength=" << sorted_synapses[i].weight << ")" << std::endl;
                 found = true;
+                count++;
+                if (count >= 5) break;
             }
         }
         if (!found) std::cout << "  (No strong prediction)" << std::endl;
     };
 
-    // Predict next words for the rhyme
-    predict("mary");
-    predict("had");
-    predict("a");
-    predict("little");
+    std::vector<std::string> test_words = {
+        "absence", "actions", "history", "knowledge", "time", "early", "don't", "money", "rome", "practice", "too", "two", "blood"
+    };
+
+    for (const auto& w : test_words) {
+        predict(w);
+    }
 
     return 0;
 }
