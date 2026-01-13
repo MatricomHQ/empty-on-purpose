@@ -1,0 +1,13 @@
+# Build Artifacts
+/bin/
+/build/
+*.o
+*.exe
+*.bin
+brain.map
+*.map
+
+# Data
+/data/
+*.zip
+*.raw
