@@ -1,0 +1,30 @@
+# Prerequisites
+*.d
+*.o
+*.obj
+
+# Compiled Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+/bin/
+/build/
+/out/
+
+# IDE/Editor Metadata
+.vscode/
+.idea/
+*.swp
+*.sln
+*.vcxproj
+*.vcxproj.user
+
+# Test Logs & Core Dumps
+*.log
+*.dump
+test_results.txt
+
+# OS generated
+.DS_Store
+Thumbs.db
