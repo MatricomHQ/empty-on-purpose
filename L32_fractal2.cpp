@@ -87,7 +87,7 @@ public:
     void* alloc(uint64_t sz) { sz=(sz+7)&~7ULL; void* p=base_+pos_; pos_+=sz; return p; }
     // Alloc 16-byte aligned (for SIMD groups)
     void* alloc16(uint64_t sz) { pos_=(pos_+15)&~15ULL; return alloc(sz); }
-    // Alloc record: [uint16_t suf_len][suffix][uint32_t val], padded to 8
+    // Alloc record: [uint16_t suf_len][suffix bytes][uint32_t val], padded to 8
     // Returns SLOT INDEX (byte_offset >> 3)
     uint32_t alloc_rec(const uint8_t* suf, uint32_t suf_len, uint32_t val) {
         uint32_t raw = 2 + suf_len + 4;
@@ -111,26 +111,32 @@ public:
 };
 
 // ═══════════════════════════════════════════════════════════════
-//  FractalTag2 — 8-byte kf, key-byte tag, CAP=32
-//  Suffix in arena. Children only when first 8 key bytes match.
+//  FractalTag2 — 4-byte kf, zero CRC, key-byte tag, CAP=16
 // ═══════════════════════════════════════════════════════════════
 class FractalTag2 {
     static constexpr uint32_t CAP = 32;
     static constexpr uint32_t MAX_GD = 24;
 
     struct alignas(16) Group {
-        uint8_t tags[32];      // 32B — CRC tag, SIMD scanned
-        uint64_t kf64s[32];   // 256B — 8-byte key fragment per entry
-        uint32_t offs[32];    // 128B — arena slot index per entry
-        uint8_t count, local_depth, sorted, _p[5]; // 8B
-    }; // Total: 32 + 256 + 128 + 8 = 424 bytes
+        uint8_t   tags[32];      // 32B
+        uint64_t  entries[32];   // 256B — (kf<<32)|off
+        uint32_t  first_idx_;    // 4B
+        uint8_t   count, local_depth, sorted, _p[5]; // 8B -> Total 300 bytes, aligns to 304
+    }; // Total: 32 + 256 + 8 = 296 bytes
+
+    // Entry accessors — kf in high 32 bits (natural uint64_t sort = kf order)
+    static uint32_t entry_kf(uint64_t e)  { return (uint32_t)(e >> 32); }
+    static uint32_t entry_off(uint64_t e) { return (uint32_t)e; }
+    static uint64_t make_entry(uint32_t kf, uint32_t off) { return ((uint64_t)kf << 32) | off; }
+
+    static constexpr uint32_t VB = 4;  // verified bytes consumed per level
 
     UArena& ua_;
     uintptr_t* dir_;
-    uint32_t gd_, ds_sz_, level_;
-    uint64_t parent_kf_;
-    uint32_t shift_;  // = 64 - gd_, for branchless di()
-    uint32_t vb_;     // = (level_ + 1) * 8, pre-computed verified bytes
+    uint32_t gd_, ds_sz_;
+    uint32_t shift_;  // = 32 - gd_, for branchless di()
+    uint32_t parent_kf_;  // kf that led to this child (for cursor key reconstruction)
+    uint32_t overlap_;    // bytes consumed from parent key to reach this child
     std::atomic<uint64_t>* count_; // shared root counter (all levels point to same)
 
     static bool is_child(uintptr_t v) { return v & 1; }
@@ -138,36 +144,38 @@ class FractalTag2 {
     static Group* get_group(uintptr_t v) { return (Group*)(uintptr_t)v; }
     static uintptr_t tag_child(FractalTag2* c) { return (uintptr_t)c | 1; }
 
-    // Extract kf (8-byte key fragment) at current level
-    void extract(const uint8_t* k, uint32_t kl, uint64_t& kf, uint8_t& tag) const {
-        uint32_t o = level_ * 8;
-        if (__builtin_expect(o + 8 <= kl, 1)) {
-            uint64_t v; memcpy(&v, k + o, 8);
-            kf = __builtin_bswap64(v);
+    // Extract kf (4-byte key fragment) — always reads from byte 0 of passed-in key
+    static void extract(const uint8_t* k, uint32_t kl, uint32_t& kf, uint8_t& tag) {
+        if (__builtin_expect(8 <= kl, 1)) {
+            uint64_t v; memcpy(&v, k, 8);
+            kf = __builtin_bswap32((uint32_t)v);
             tag = (uint8_t)((__crc32cd(0, v) >> 25) | 0x80);
-        } else {
-            uint64_t v = 0;
-            if (o < kl) memcpy(&v, k + o, kl - o);
-            kf = __builtin_bswap64(v);
-            tag = (uint8_t)((__crc32cd(0, kf) >> 25) | 0x80);
+            return;
         }
+        kf = 0;
+        if (kl > 0) { uint32_t a4 = kl > 4 ? 4 : kl; memcpy(&kf, k, a4); }
+        kf = __builtin_bswap32(kf);
+        uint64_t v = 0;
+        if (kl > 0) { uint32_t a8 = kl > 8 ? 8 : kl; memcpy(&v, k, a8); }
+        tag = (uint8_t)((__crc32cd(0, v) >> 25) | 0x80);
     }
 
     // Branchless: when gd_=0, ds_sz_=1, mask=0 → result always 0. No UB.
-    uint32_t di(uint64_t kf) const { return (uint32_t)(kf >> (shift_ & 63)) & (ds_sz_ - 1); }
+    uint32_t di(uint32_t kf) const { return (kf >> (shift_ & 31)) & (ds_sz_ - 1); }
 
-    // Compare suffix: checks BOTH length and content
-    bool suffix_eq(uint32_t off, const uint8_t* suf, uint32_t query_suf_len) const {
-        uint16_t stored_sl = ua_.rec_sl(off); // currently stores kl - vb_ OR 0
-        if (stored_sl != query_suf_len) return false;
+    // Compare suffix stored in arena
+    bool suf_eq(uint32_t off, const uint8_t* suf, uint32_t suf_len) const {
+        uint16_t stored_sl = ua_.rec_sl(off);
+        if (stored_sl != suf_len) return false;
         if (!stored_sl) return true;
-        return !memcmp(ua_.rec_suf(off), suf, stored_sl);
+        return !memcmp(ua_.rec_suf(off), suf, suf_len);
     }
 
-    Group* alloc_group(uint8_t ld) {
-        auto* g = (Group*)ua_.alloc16(sizeof(Group));
-        memset(g->tags, 0, sizeof(g->tags));
+    Group* alloc_group(uint8_t ld, uint32_t first_idx = 0) {
+        Group* g = (Group*)ua_.alloc16(sizeof(Group));
+        memset(g->tags, 0, 32);
         g->count = 0; g->local_depth = ld; g->sorted = 1;
+        g->first_idx_ = first_idx;
         return g;
     }
 
@@ -175,22 +183,45 @@ class FractalTag2 {
         uint32_t ns = ds_sz_ * 2;
         auto* nd = (uintptr_t*)ua_.alloc(ns * sizeof(uintptr_t));
         for (uint32_t i = 0; i < ds_sz_; i++) { nd[2*i] = dir_[i]; nd[2*i+1] = dir_[i]; }
+        // Update first_idx_ for all groups (indices doubled)
+        for (uint32_t i = 0; i < ds_sz_; i++) {
+            if (!is_child(nd[2*i])) {
+                Group* g = get_group(nd[2*i]);
+                if (g->first_idx_ == i) g->first_idx_ = 2 * i;
+            }
+        }
         dir_ = nd; ds_sz_ = ns; gd_++; shift_--;
     }
 
-    void spawn_child(uint32_t dx) {
+    void spawn_child(uint32_t dx, uint32_t overlap) {
         Group* old = get_group(dir_[dx]);
-        uint64_t shared_kf = old->kf64s[0];
+        uint32_t shared_kf = entry_kf(old->entries[0]);
         uint8_t ld = old->local_depth;
 
         auto* child = (FractalTag2*)ua_.alloc(sizeof(FractalTag2));
-        new (child) FractalTag2(ua_, count_, level_ + 1, shared_kf);
+        new (child) FractalTag2(ua_, count_, shared_kf, overlap);
 
+        // Pre-subtract — child->insert() will re-add each
+        count_->fetch_sub(old->count, std::memory_order_relaxed);
+
+        // Reconstruct each entry's remaining key: [kf_bytes][suffix]
+        // Then pass to child shifted by 'overlap' bytes
         for (uint32_t i = 0; i < old->count; i++) {
-            uint16_t stored_sl = ua_.rec_sl(old->offs[i]);
-            const uint8_t* parent_suf = ua_.rec_suf(old->offs[i]);
-            uint32_t val = ua_.rec_val(old->offs[i]);
-            child->insert_from_data(parent_suf, stored_sl, val);
+            uint32_t off = entry_off(old->entries[i]);
+            uint32_t ekf = entry_kf(old->entries[i]);
+            uint16_t stored_sl = ua_.rec_sl(off);
+            uint32_t val = ua_.rec_val(off);
+
+            // Reconstruct: [4B kf BE][suffix]
+            uint8_t temp[4096];
+            uint32_t kf_be = __builtin_bswap32(ekf);
+            memcpy(temp, &kf_be, 4);
+            if (stored_sl > 0) memcpy(temp + 4, ua_.rec_suf(off), stored_sl);
+            uint32_t total_len = 4 + stored_sl;
+
+            // Shift by overlap for child
+            uint32_t child_len = (total_len > overlap) ? total_len - overlap : 0;
+            child->insert(temp + overlap, child_len, val);
         }
 
         uint32_t stride = 1u << (gd_ - ld);
@@ -198,158 +229,106 @@ class FractalTag2 {
         for (uint32_t i = st; i < st + stride; i++) dir_[i] = tag_child(child);
     }
 
-    void separate_from_child(uint32_t dx, uint64_t kf, FractalTag2* child) {
-        uint64_t diff = kf ^ child->parent_kf_;
-        if (diff == 0) return;
-        uint8_t sep_bit = (uint8_t)__builtin_clzll(diff);
-        if (sep_bit >= MAX_GD) return;
-        while (sep_bit >= gd_) { double_dir(); dx <<= 1; }
-        uint8_t new_side = (kf >> (63 - sep_bit)) & 1;
-        Group* fresh = alloc_group(sep_bit + 1);
-        uint32_t new_dx = di(kf);
-        uint32_t stride = 1u << (gd_ - sep_bit);
-        uint32_t parent_stride = stride * 2;
-        uint32_t st = new_dx & ~(parent_stride - 1);
-        for (uint32_t i = st; i < st + parent_stride; i++) {
-            uint8_t side = (i >> (gd_ - 1 - sep_bit)) & 1;
-            if (side == new_side) dir_[i] = (uintptr_t)fresh;
-        }
-    }
-
     void split_or_spawn(uint32_t dx) {
         Group* old = get_group(dir_[dx]);
         uint8_t ld = old->local_depth;
 
-        // XOR + CLZ on 64-bit kf — uses ALL key bytes, no MAX_GD masking
-        uint64_t kf0 = old->kf64s[0];
-        uint64_t diff = 0;
+        uint32_t kf0 = entry_kf(old->entries[0]);
+        uint32_t diff = 0;
         for (uint32_t i = 1; i < old->count; i++)
-            diff |= kf0 ^ old->kf64s[i];
-        uint64_t mask = (ld == 0) ? ~0ULL : ((1ULL << (64 - ld)) - 1);
-        if (MAX_GD < 64) mask &= (~0ULL << (64 - MAX_GD));
-        diff &= mask;
-        uint8_t split_ld = (diff != 0) ? (uint8_t)__builtin_clzll(diff) : 255;
+            diff |= kf0 ^ entry_kf(old->entries[i]);
 
-        if (split_ld == 255) { spawn_child(dx); return; }
+        // Mask out bits above current ld (already discriminated)
+        if (ld > 0) diff &= ((1u << (32 - ld)) - 1);
 
+        if (diff == 0) {
+            // All kf identical — child sees bytes past entire kf window
+            spawn_child(dx, VB); return;
+        }
+
+        uint8_t split_ld = (uint8_t)__builtin_clz(diff);
+        if (split_ld >= MAX_GD) {
+            // Differentiating bit at position split_ld is in byte split_ld/8
+            // Overlap = split_ld/8 so child window starts at the differing byte
+            uint32_t overlap = split_ld / 8;
+            if (overlap < 1) overlap = 1;
+            spawn_child(dx, overlap); return;
+        }
         while (split_ld >= gd_) { double_dir(); dx <<= 1; }
 
         Group* g0 = alloc_group(split_ld + 1), *g1 = alloc_group(split_ld + 1);
         for (uint32_t i = 0; i < old->count; i++) {
-            uint64_t ekf = old->kf64s[i];
-            uint8_t side = (ekf >> (63 - split_ld)) & 1;
+            uint32_t ekf = entry_kf(old->entries[i]);
+            uint8_t side = (ekf >> (31 - split_ld)) & 1;
             Group* d = side ? g1 : g0; uint32_t p = d->count;
-            d->tags[p] = old->tags[i]; d->kf64s[p] = ekf; d->offs[p] = old->offs[i];
+            d->tags[p] = old->tags[i]; d->entries[p] = old->entries[i];
             d->count++;
         }
 
-        uint32_t stride = 1u << (gd_ - ld);
-        uint32_t st = dx & ~(stride - 1);
-        for (uint32_t i = st; i < st + stride; i++) {
+        // Update ALL directory slots of old group's span, track first occurrence
+        uint32_t old_stride = 1u << (gd_ - ld);
+        uint32_t st = dx & ~(old_stride - 1);
+        bool g0_first_set = false, g1_first_set = false;
+        for (uint32_t i = st; i < st + old_stride; i++) {
             uint8_t side = (i >> (gd_ - 1 - split_ld)) & 1;
-            dir_[i] = (uintptr_t)(side ? g1 : g0);
+            if (side) {
+                dir_[i] = (uintptr_t)g1;
+                if (!g1_first_set) { g1->first_idx_ = i; g1_first_set = true; }
+            } else {
+                dir_[i] = (uintptr_t)g0;
+                if (!g0_first_set) { g0->first_idx_ = i; g0_first_set = true; }
+            }
         }
         g0->sorted = 0;
         g1->sorted = 0;
     }
 
-    // Insert from suffix data (used by spawn_child / child routing)
-    // Returns true if NEW key, false if update
-    bool insert_from_data(const uint8_t* data, uint32_t data_len, uint32_t v) {
-        uint64_t kf; uint8_t tag;
-        if (__builtin_expect(data_len >= 8, 1)) {
-            uint64_t v8; memcpy(&v8, data, 8);
-            kf = __builtin_bswap64(v8);
-            tag = (uint8_t)((__crc32cd(0, v8) >> 25) | 0x80);
-        } else {
-            uint64_t v8 = 0;
-            if (data_len > 0) { memcpy(&v8, data, data_len); }
-            kf = __builtin_bswap64(v8);
-            tag = (uint8_t)((__crc32cd(0, kf) >> 25) | 0x80);
-        }
-        const uint8_t* suf = data + 8;
-        uint32_t suf_len = (data_len >= 8) ? data_len - 8 : 0;
-
-        for (int a = 0; a < 64; a++) {
-            uint32_t dx = di(kf);
-            uintptr_t slot = dir_[dx];
-            if (is_child(slot)) {
-                FractalTag2* child = get_child(slot);
-                if (child->parent_kf_ == kf) {
-                    return child->insert_from_data(suf, suf_len, v);
-                }
-                separate_from_child(dx, kf, child);
-                continue;
-            }
-            Group* g = get_group(slot);
-            uint32_t mm = scan32(g->tags, tag);
-            while (mm) {
-                int p = __builtin_ctz(mm);
-                if (g->kf64s[p] == kf && suffix_eq(g->offs[p], suf, suf_len)) {
-                    ua_.rec_set_val(g->offs[p], v); return false;
-                }
-                mm &= mm - 1;
-            }
-            if (g->count >= CAP) { split_or_spawn(dx); continue; }
-            uint32_t sb_off = ua_.alloc_rec(suf, suf_len, v);
-            uint32_t s = g->count;
-            g->tags[s] = tag; g->kf64s[s] = kf; g->offs[s] = sb_off;
-            g->count++; g->sorted = 0;
-            count_->fetch_add(1, std::memory_order_relaxed);
-            return true;
-        }
-        return false;
-    }
-
 public:
-    FractalTag2(UArena& ua, std::atomic<uint64_t>* cnt, uint32_t level = 0, uint64_t pkf = 0)
-        : ua_(ua), count_(cnt), level_(level), parent_kf_(pkf) {
-        gd_ = 0; ds_sz_ = 1; shift_ = 64;
-        vb_ = (level + 1) * 8;
+    FractalTag2(UArena& ua, std::atomic<uint64_t>* cnt, uint32_t pkf = 0, uint32_t overlap = 0)
+        : ua_(ua), count_(cnt), parent_kf_(pkf), overlap_(overlap) {
+        gd_ = 0; ds_sz_ = 1; shift_ = 32;
         dir_ = (uintptr_t*)ua_.alloc(sizeof(uintptr_t));
         dir_[0] = (uintptr_t)alloc_group(0);
     }
 
     // Returns true if NEW key inserted, false if existing key updated
+    // Key-shifting: each level sees k starting at its own 4-byte window
     bool insert(const uint8_t* k, uint32_t kl, uint32_t v) {
-        uint64_t kf; uint8_t tag;
-        extract(k, kl, kf, tag);
-        uint8_t short_suf[1];
-        uint32_t suf_len;
-        const uint8_t* suf;
-        if (kl >= vb_) {
-            suf_len = kl - vb_;
-            suf = (suf_len > 0) ? k + vb_ : nullptr;
-        } else {
-            suf_len = 1;
-            short_suf[0] = (uint8_t)kl;
-            suf = short_suf;
-        }
+        FractalTag2* node = this;
+        const uint8_t* ck = k; uint32_t ckl = kl; // current shifted key
+        uint32_t kf; uint8_t tag;
+        extract(ck, ckl, kf, tag);
+        uint32_t suf_len = (ckl > VB) ? (ckl - VB) : 0;
+        const uint8_t* suf = (suf_len > 0) ? ck + VB : nullptr;
 
-        for (int a = 0; a < 64; a++) {
-            uint32_t dx = di(kf);
-            uintptr_t slot = dir_[dx];
+        for (int a = 0; a < 256; a++) {
+            uint32_t dx = node->di(kf);
+            uintptr_t slot = node->dir_[dx];
             if (is_child(slot)) {
                 FractalTag2* child = get_child(slot);
-                if (child->parent_kf_ == kf) {
-                    return child->insert_from_data(suf, suf_len, v);
-                }
-                separate_from_child(dx, kf, child);
+                uint32_t ob = child->overlap_;
+                // Shift key by child's overlap bytes
+                ck = (ckl > ob) ? ck + ob : ck + ckl;
+                ckl = (ckl > ob) ? ckl - ob : 0;
+                node = child;
+                extract(ck, ckl, kf, tag);
+                suf_len = (ckl > VB) ? (ckl - VB) : 0;
+                suf = (suf_len > 0) ? ck + VB : nullptr;
                 continue;
             }
             Group* g = get_group(slot);
             uint32_t mm = scan32(g->tags, tag);
             while (mm) {
                 int p = __builtin_ctz(mm);
-                if (g->kf64s[p] == kf && suffix_eq(g->offs[p], suf, suf_len)) {
-                    ua_.rec_set_val(g->offs[p], v); return false;
+                if (entry_kf(g->entries[p]) == kf && node->suf_eq(entry_off(g->entries[p]), suf, suf_len)) {
+                    node->ua_.rec_set_val(entry_off(g->entries[p]), v); return false;
                 }
                 mm &= mm - 1;
             }
-            if (g->count >= CAP) { split_or_spawn(dx); continue; }
-            uint32_t sb_off = ua_.alloc_rec(suf, suf_len, v);
+            if (g->count >= CAP) { node->split_or_spawn(dx); continue; }
+            uint32_t sb_off = node->ua_.alloc_rec(suf, suf_len, v);
             uint32_t s = g->count;
-            g->tags[s] = tag; g->kf64s[s] = kf; g->offs[s] = sb_off;
+            g->tags[s] = tag; g->entries[s] = make_entry(kf, sb_off);
             g->count++; g->sorted = 0;
             count_->fetch_add(1, std::memory_order_relaxed);
             return true;
@@ -358,37 +337,81 @@ public:
     }
 
     bool get(const uint8_t* k, uint32_t kl, uint32_t& out) const {
-        uint64_t kf; uint8_t tag;
-        extract(k, kl, kf, tag);
-        uint8_t short_suf[1];
-        uint32_t suf_len;
-        const uint8_t* suf;
-        if (kl >= vb_) {
-            suf_len = kl - vb_;
-            suf = (suf_len > 0) ? k + vb_ : nullptr;
-        } else {
-            suf_len = 1;
-            short_suf[0] = (uint8_t)kl;
-            suf = short_suf;
+        const FractalTag2* node = this;
+        const uint8_t* ck = k; uint32_t ckl = kl;
+        uint32_t kf; uint8_t tag;
+        extract(ck, ckl, kf, tag);
+        uint32_t suf_len = (ckl > VB) ? (ckl - VB) : 0;
+        const uint8_t* suf = (suf_len > 0) ? ck + VB : nullptr;
+
+        while (true) {
+            uint32_t dx = node->di(kf);
+            uintptr_t slot = node->dir_[dx];
+            if (is_child(slot)) {
+                const FractalTag2* child = get_child(slot);
+                uint32_t ob = child->overlap_;
+                ck = (ckl > ob) ? ck + ob : ck + ckl;
+                ckl = (ckl > ob) ? ckl - ob : 0;
+                node = child;
+                extract(ck, ckl, kf, tag);
+                suf_len = (ckl > VB) ? (ckl - VB) : 0;
+                suf = (suf_len > 0) ? ck + VB : nullptr;
+                continue;
+            }
+            Group* g = get_group(slot);
+            uint32_t mm = scan32(g->tags, tag);
+            while (mm) {
+                int p = __builtin_ctz(mm);
+                if (entry_kf(g->entries[p]) == kf && node->suf_eq(entry_off(g->entries[p]), suf, suf_len)) {
+                    out = node->ua_.rec_val(entry_off(g->entries[p])); return true;
+                }
+                mm &= mm - 1;
+            }
+            return false;
         }
-        return get_inner(suf, suf_len, kf, tag, out);
     }
 
+    // Erase: returns true if key was found and removed
     bool erase(const uint8_t* k, uint32_t kl) {
-        uint64_t kf; uint8_t tag;
-        extract(k, kl, kf, tag);
-        uint8_t short_suf[1];
-        uint32_t suf_len;
-        const uint8_t* suf;
-        if (kl >= vb_) {
-            suf_len = kl - vb_;
-            suf = (suf_len > 0) ? k + vb_ : nullptr;
-        } else {
-            suf_len = 1;
-            short_suf[0] = (uint8_t)kl;
-            suf = short_suf;
+        FractalTag2* node = this;
+        const uint8_t* ck = k; uint32_t ckl = kl;
+        uint32_t kf; uint8_t tag;
+        extract(ck, ckl, kf, tag);
+        uint32_t suf_len = (ckl > VB) ? (ckl - VB) : 0;
+        const uint8_t* suf = (suf_len > 0) ? ck + VB : nullptr;
+
+        while (true) {
+            uint32_t dx = node->di(kf);
+            uintptr_t slot = node->dir_[dx];
+            if (is_child(slot)) {
+                FractalTag2* child = get_child(slot);
+                uint32_t ob = child->overlap_;
+                ck = (ckl > ob) ? ck + ob : ck + ckl;
+                ckl = (ckl > ob) ? ckl - ob : 0;
+                node = child;
+                extract(ck, ckl, kf, tag);
+                suf_len = (ckl > VB) ? (ckl - VB) : 0;
+                suf = (suf_len > 0) ? ck + VB : nullptr;
+                continue;
+            }
+            Group* g = get_group(slot);
+            uint32_t mm = scan32(g->tags, tag);
+            while (mm) {
+                int p = __builtin_ctz(mm);
+                if (entry_kf(g->entries[p]) == kf && node->suf_eq(entry_off(g->entries[p]), suf, suf_len)) {
+                    g->count--;
+                    if (p < g->count) {
+                        memmove(&g->tags[p], &g->tags[p+1], g->count - p);
+                        memmove(&g->entries[p], &g->entries[p+1], (g->count - p) * 8);
+                    }
+                    g->tags[g->count] = 0; g->entries[g->count] = 0;
+                    count_->fetch_sub(1, std::memory_order_relaxed);
+                    return true;
+                }
+                mm &= mm - 1;
+            }
+            return false;
         }
-        return erase_inner(suf, suf_len, kf, tag);
     }
 
     bool contains(const uint8_t* k, uint32_t kl) const {
@@ -400,102 +423,30 @@ public:
     bool empty() const { return size() == 0; }
 
 private:
-    bool get_inner(const uint8_t* suf, uint32_t suf_len, uint64_t kf, uint8_t tag, uint32_t& out) const {
-        uint32_t dx = di(kf);
-        uintptr_t slot = dir_[dx];
-        if (is_child(slot)) {
-            FractalTag2* child = get_child(slot);
-            if (child->parent_kf_ != kf) return false;
-            uint64_t ckf; uint8_t ctag;
-            if (__builtin_expect(suf_len >= 8, 1)) {
-                uint64_t v8; memcpy(&v8, suf, 8);
-                ckf = __builtin_bswap64(v8);
-                ctag = (uint8_t)((__crc32cd(0, v8) >> 25) | 0x80);
-            } else {
-                uint64_t v8 = 0;
-                if (suf_len > 0) { memcpy(&v8, suf, suf_len); }
-                ckf = __builtin_bswap64(v8);
-                ctag = (uint8_t)((__crc32cd(0, ckf) >> 25) | 0x80);
-            }
-            uint32_t csuf_len = (suf_len >= 8) ? suf_len - 8 : 0;
-            return child->get_inner(suf + 8, csuf_len, ckf, ctag, out);
-        }
-        Group* g = get_group(slot);
-        uint32_t mm = scan32(g->tags, tag);
-        while (mm) {
-            int p = __builtin_ctz(mm);
-            if (g->kf64s[p] == kf && suffix_eq(g->offs[p], suf, suf_len)) {
-                out = ua_.rec_val(g->offs[p]); return true;
-            }
-            mm &= mm - 1;
-        }
-        return false;
-    }
-
-    // Erase inner: swap-with-last in group, O(1)
-    bool erase_inner(const uint8_t* suf, uint32_t suf_len, uint64_t kf, uint8_t tag) {
-        uint32_t dx = di(kf);
-        uintptr_t slot = dir_[dx];
-        if (is_child(slot)) {
-            FractalTag2* child = get_child(slot);
-            if (child->parent_kf_ != kf) return false;
-            uint64_t ckf; uint8_t ctag;
-            if (__builtin_expect(suf_len >= 8, 1)) {
-                uint64_t v8; memcpy(&v8, suf, 8);
-                ckf = __builtin_bswap64(v8);
-                ctag = (uint8_t)((__crc32cd(0, v8) >> 25) | 0x80);
-            } else {
-                uint64_t v8 = 0;
-                if (suf_len > 0) { memcpy(&v8, suf, suf_len); }
-                ckf = __builtin_bswap64(v8);
-                ctag = (uint8_t)((__crc32cd(0, ckf) >> 25) | 0x80);
-            }
-            uint32_t csuf_len = (suf_len >= 8) ? suf_len - 8 : 0;
-            return child->erase_inner(suf + 8, csuf_len, ckf, ctag);
-        }
-        Group* g = get_group(slot);
-        uint32_t mm = scan32(g->tags, tag);
-        while (mm) {
-            int p = __builtin_ctz(mm);
-            if (g->kf64s[p] == kf && suffix_eq(g->offs[p], suf, suf_len)) {
-                uint32_t last = g->count - 1;
-                if ((uint32_t)p != last) {
-                    g->tags[p]     = g->tags[last];
-                    g->kf64s[p]    = g->kf64s[last];
-                    g->offs[p]     = g->offs[last];
-                }
-                g->tags[last] = 0;
-                g->count--; g->sorted = 0;
-                count_->fetch_sub(1, std::memory_order_relaxed);
-                return true;
-            }
-            mm &= mm - 1;
-        }
-        return false;
-    }
 
     // Sort group entries by kf (insertion sort on uint64_t — kf in high bits)
     // Direct sort on entries array — zero packing, zero permute
-    // Sort group entries by kf64s
     void sort_group(Group* g) const {
         if (g->sorted || g->count <= 1) { g->sorted = 1; return; }
         uint32_t n = g->count;
         for (uint32_t i = 1; i < n; i++) {
-            uint64_t ekf = g->kf64s[i];
-            uint32_t eoff = g->offs[i];
-            uint8_t  etag = g->tags[i];
+            uint64_t ent = g->entries[i];
+            uint8_t  tag = g->tags[i];
+            uint32_t kf_ent = entry_kf(ent);
+            uint32_t off_ent = entry_off(ent);
             int j = (int)i - 1;
             while (j >= 0) {
-                uint64_t kfj = g->kf64s[j];
+                uint64_t ej = g->entries[j];
+                uint32_t kfj = entry_kf(ej);
                 bool larger = false;
-                if (kfj > ekf) {
+                if (kfj > kf_ent) {
                     larger = true;
-                } else if (kfj == ekf) {
-                    uint32_t offj = g->offs[j];
+                } else if (kfj == kf_ent) {
+                    uint32_t offj = entry_off(ej);
                     uint16_t l1 = ua_.rec_sl(offj);
-                    uint16_t l2 = ua_.rec_sl(eoff);
+                    uint16_t l2 = ua_.rec_sl(off_ent);
                     const uint8_t* s1 = ua_.rec_suf(offj);
-                    const uint8_t* s2 = ua_.rec_suf(eoff);
+                    const uint8_t* s2 = ua_.rec_suf(off_ent);
                     uint16_t min_l = l1 < l2 ? l1 : l2;
                     int cmp = memcmp(s1, s2, min_l);
                     if (cmp > 0 || (cmp == 0 && l1 > l2)) {
@@ -504,14 +455,12 @@ private:
                 }
                 if (!larger) break;
 
-                g->kf64s[j+1] = kfj;
-                g->offs[j+1]  = g->offs[j];
-                g->tags[j+1]  = g->tags[j];
+                g->entries[j+1] = ej;
+                g->tags[j+1]    = g->tags[j];
                 j--;
             }
-            g->kf64s[j+1] = ekf;
-            g->offs[j+1]  = eoff;
-            g->tags[j+1]  = etag;
+            g->entries[j+1] = ent;
+            g->tags[j+1]    = tag;
         }
         g->sorted = 1;
     }
@@ -541,6 +490,29 @@ public:
             stack_[++depth_] = {node, di, -1};
         }
 
+        // O(1) dedup: group knows its first directory index
+        bool is_first_visit(const Frame& f, uintptr_t slot) const {
+            if (is_child(slot)) {
+                for (uint32_t j = 0; j < f.dir_idx; j++)
+                    if (f.node->dir_[j] == slot) return false;
+                return true;
+            }
+            Group* g = get_group(slot);
+            return f.dir_idx == g->first_idx_;
+        }
+        // Reverse: group knows its LAST directory index via stride from first_idx_
+        bool is_last_visit(const Frame& f, uintptr_t slot) const {
+            if (is_child(slot)) {
+                for (uint32_t j = f.dir_idx + 1; j < f.node->ds_sz_; j++)
+                    if (f.node->dir_[j] == slot) return false;
+                return true;
+            }
+            Group* g = get_group(slot);
+            uint32_t stride = 1u << (f.node->gd_ - g->local_depth);
+            uint32_t last_idx = g->first_idx_ + stride - 1;
+            return f.dir_idx == last_idx;
+        }
+
         void set_leaf() {
             auto& f = stack_[depth_];
             cur_group_ = get_group(f.node->dir_[f.dir_idx]);
@@ -548,17 +520,26 @@ public:
         }
 
         void build_key() const {
+            // Reconstruct full key from stack:
+            // depth 0 = root (parent_kf_ = 0, overlap_ = 0, skip)
+            // depth 1..N = child levels: contribute overlap_ bytes from parent_kf_
+            // leaf frame: entry kf (VB bytes) + suffix
             key_len_ = 0;
+            // Add parent prefix bytes from each child level
             for (int i = 1; i <= depth_; i++) {
-                uint64_t pkf = __builtin_bswap64(stack_[i].node->parent_kf_);
-                memcpy(key_buf_ + key_len_, &pkf, 8);
-                key_len_ += 8;
+                uint32_t ob = stack_[i].node->overlap_;
+                uint32_t pkf_be = __builtin_bswap32(stack_[i].node->parent_kf_);
+                memcpy(key_buf_ + key_len_, &pkf_be, ob);
+                key_len_ += ob;
             }
+            // Add leaf kf + suffix
             auto& f = stack_[depth_];
-            uint64_t kf = __builtin_bswap64(cur_group_->kf64s[f.group_idx]);
-            memcpy(key_buf_ + key_len_, &kf, 8);
-            key_len_ += 8;
-            uint32_t off = cur_group_->offs[f.group_idx];
+            Group* g = get_group(f.node->dir_[f.dir_idx]);
+            uint32_t ekf = entry_kf(g->entries[f.group_idx]);
+            uint32_t kf_be = __builtin_bswap32(ekf);
+            memcpy(key_buf_ + key_len_, &kf_be, VB);
+            key_len_ += VB;
+            uint32_t off = entry_off(g->entries[f.group_idx]);
             uint16_t sl = f.node->ua_.rec_sl(off);
             if (sl > 0) {
                 memcpy(key_buf_ + key_len_, f.node->ua_.rec_suf(off), sl);
@@ -582,7 +563,8 @@ public:
                 }
                 while (f.dir_idx < f.node->ds_sz_) {
                     uintptr_t slot = f.node->dir_[f.dir_idx];
-                    if (f.dir_idx > 0 && slot == f.node->dir_[f.dir_idx - 1]) {
+                    // Skip non-first visits (O(1) dedup)
+                    if (!is_first_visit(f, slot)) {
                         f.dir_idx++; continue;
                     }
                     if (is_child(slot)) { push(get_child(slot)); break; }
@@ -614,31 +596,25 @@ public:
                         return true;
                     }
                     f.group_idx = -1;
-                    // Move to previous dir entry
                 }
                 // Scan directory backwards
                 while (true) {
-                    if (f.dir_idx == 0 && f.group_idx < 0) {
-                        // Check slot 0 first time (haven't visited it yet going backwards)
-                        // But only if we haven't already processed it
-                        break; // exhausted
-                    }
+                    if (f.dir_idx == 0 && f.group_idx < 0) break;
                     f.dir_idx--;
                     uintptr_t slot = f.node->dir_[f.dir_idx];
-                    // Skip duplicates (going left, skip if same as previous = f.dir_idx+1)
-                    if (f.dir_idx + 1 < f.node->ds_sz_ && slot == f.node->dir_[f.dir_idx + 1]) { 
+                    if (!is_last_visit(f, slot)) {
                         if (f.dir_idx == 0) break;
                         continue;
                     }
                     if (is_child(slot)) {
                         FractalTag2* child = get_child(slot);
-                        push_at(child, child->ds_sz_); // will scan backwards
+                        push_at(child, child->ds_sz_);
                         break;
                     }
                     Group* g = get_group(slot);
                     if (g->count > 0) {
                         f.node->sort_group(g);
-                        f.group_idx = g->count - 1; // last entry
+                        f.group_idx = g->count - 1;
                         set_leaf();
                         return true;
                     }
@@ -647,8 +623,7 @@ public:
                 if (f.group_idx < 0) {
                     depth_--;
                     if (depth_ >= 0) {
-                        // Parent was at some dir_idx, we need to continue scanning backwards
-                        stack_[depth_].group_idx = -1; // force dir scan
+                        stack_[depth_].group_idx = -1;
                     }
                 }
             }
@@ -670,7 +645,7 @@ public:
         // ── seek_ge within a level ──
         // full_key/full_kl is the ORIGINAL search key (all levels use their own offset)
         bool seek_ge_at(const FractalTag2* node, const uint8_t* full_key, uint32_t full_kl) {
-            uint64_t kf; uint8_t tag;
+            uint32_t kf; uint8_t tag;
             node->extract(full_key, full_kl, kf, tag);
             uint32_t start = node->di(kf);
             push_at(node, start);
@@ -685,17 +660,7 @@ public:
 
                 if (is_child(slot)) {
                     FractalTag2* child = get_child(slot);
-                    if (child->parent_kf_ < kf) {
-                        f.dir_idx++; continue; // skip: all entries in child < search
-                    }
-                    if (child->parent_kf_ > kf) {
-                        // All entries > search, seek_first
-                        if (descend_first(child)) return true;
-                        depth_--; // pop child frame if it was empty
-                        f.dir_idx++;
-                        continue;
-                    }
-                    // parent_kf_ == kf: descend and seek_ge on next level
+                    // Always descend into child and seek_ge on next level
                     if (seek_ge_at(child, full_key, full_kl)) return true;
                     depth_--; // pop child if exhausted
                     f.dir_idx++;
@@ -724,27 +689,28 @@ public:
 
         // Binary search + suffix compare within sorted group
         static int find_ge_in_group(const FractalTag2* node, Group* g,
-                                     uint64_t search_kf,
+                                     uint32_t search_kf,
                                      const uint8_t* full_key, uint32_t full_kl) {
             int n = (int)g->count;
-            // Binary search: first entry with kf >= search_kf
+            // Binary search: first entry with entry_kf >= search_kf
             int lo = 0, hi = n;
             while (lo < hi) {
                 int mid = (lo + hi) / 2;
-                if (g->kf64s[mid] < search_kf) lo = mid + 1;
+                if (entry_kf(g->entries[mid]) < search_kf) lo = mid + 1;
                 else hi = mid;
             }
             if (lo >= n) return -1;
 
-            if (g->kf64s[lo] > search_kf) return lo;
+            // If kf > search_kf → any entry from here is > search key
+            if (entry_kf(g->entries[lo]) > search_kf) return lo;
 
             // kf == search_kf → compare suffixes
-            uint32_t suf_off = (node->level_ + 1) * 8;
+            uint32_t suf_off = VB;
             const uint8_t* search_suf = (full_kl > suf_off) ? full_key + suf_off : nullptr;
             uint32_t search_sl = (full_kl > suf_off) ? full_kl - suf_off : 0;
 
-            for (int i = lo; i < n && g->kf64s[i] == search_kf; i++) {
-                uint32_t off = g->offs[i];
+            for (int i = lo; i < n && entry_kf(g->entries[i]) == search_kf; i++) {
+                uint32_t off = entry_off(g->entries[i]);
                 uint16_t stored_sl = node->ua_.rec_sl(off);
                 uint32_t min_sl = stored_sl < search_sl ? stored_sl : search_sl;
                 int cmp = (min_sl > 0) ? memcmp(node->ua_.rec_suf(off), search_suf, min_sl) : 0;
@@ -753,7 +719,7 @@ public:
 
             // All entries with this kf < search → next distinct kf
             int next = lo;
-            while (next < n && g->kf64s[next] == search_kf) next++;
+            while (next < n && entry_kf(g->entries[next]) == search_kf) next++;
             return (next < n) ? next : -1;
         }
 
@@ -812,15 +778,16 @@ public:
         }
 
         uint32_t val() const {
+            if (!cur_group_) return 0;
             auto& f = stack_[depth_];
-            return f.node->ua_.rec_val(cur_group_->offs[f.group_idx]);
+            return f.node->ua_.rec_val(entry_off(cur_group_->entries[f.group_idx]));
         }
 
         // ── Mutation ──
 
         void update(uint32_t v) {
             auto& f = stack_[depth_];
-            f.node->ua_.rec_set_val(cur_group_->offs[f.group_idx], v);
+            f.node->ua_.rec_set_val(entry_off(cur_group_->entries[f.group_idx]), v);
         }
 
         // ── Prefix check (for prefix scans) ──
@@ -851,8 +818,8 @@ public:
             for (auto* s : seen) if (s == c) { found = true; break; }
             if (!found) { seen.push_back(c); uc++; }
         }
-        printf("  L%u: dir=%u grp=%u ent=%u avg=%.1f children=%u arena=%.1fMB\n",
-            level_, ds_sz_, n_grp, n_ent, n_grp?n_ent/(double)n_grp:0.0, uc, ua_.used()/(1024.0*1024.0));
+        printf("  D%d: dir=%u grp=%u ent=%u avg=%.1f children=%u arena=%.1fMB\n",
+            indent, ds_sz_, n_grp, n_ent, n_grp?n_ent/(double)n_grp:0.0, uc, ua_.used()/(1024.0*1024.0));
         for (auto* c : seen) c->stats(indent + 1);
     }
 };
@@ -942,6 +909,161 @@ static void gen_keys(std::vector<uint8_t>& out, uint32_t n, uint32_t kl, bool se
     out.resize((size_t)n * kl, 0);
     if (seq) { for (uint32_t i = 0; i < n; i++) { uint64_t v=i+1; memcpy(&out[(size_t)i*kl],&v,8<kl?8:kl); } }
     else { arc4random_buf(out.data(), out.size()); }
+}
+
+#include <algorithm>
+
+static void bench_mega_cursor() {
+    printf("\n  ── MEGA CURSOR BENCHMARK ──\n");
+    uint32_t N = 1000000;
+
+    // ─── Test 1: Random 16B keys (baseline, 2 levels max) ───
+    {
+        FT2W m(0);
+        printf("  [1] 1M random 16B keys\n");
+        std::vector<uint8_t> keys(N * 16);
+        arc4random_buf(keys.data(), keys.size());
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (uint32_t i = 0; i < N; i++)
+            m.insert(&keys[i*16], 16, i);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        printf("      Insert: %.1f ns/key\n", std::chrono::duration<double,std::nano>(t1-t0).count()/N);
+
+        auto c = m.create_cursor();
+        // Sort+Iter
+        auto t2 = std::chrono::high_resolution_clock::now();
+        c.seek_first(); uint32_t cnt = 0;
+        while(c.valid()) { cnt++; c.next(); }
+        auto t3 = std::chrono::high_resolution_clock::now();
+        printf("      Sort+Iter: %.1f ns/key (%u found)\n", std::chrono::duration<double,std::nano>(t3-t2).count()/cnt, cnt);
+
+        // Pure iterate (pre-sorted)
+        t2 = std::chrono::high_resolution_clock::now();
+        c.seek_first(); cnt = 0;
+        while(c.valid()) { cnt++; c.next(); }
+        t3 = std::chrono::high_resolution_clock::now();
+        printf("      Pure Iter: %.1f ns/key\n", std::chrono::duration<double,std::nano>(t3-t2).count()/cnt);
+
+        // Reverse
+        t2 = std::chrono::high_resolution_clock::now();
+        c.seek_last(); cnt = 0;
+        while(c.valid()) { cnt++; c.prev(); }
+        t3 = std::chrono::high_resolution_clock::now();
+        printf("      Reverse:   %.1f ns/key (%u found)\n", std::chrono::duration<double,std::nano>(t3-t2).count()/cnt, cnt);
+
+        // Verify sorted order
+        c.seek_first(); uint32_t bad = 0;
+        uint8_t prev[16]; memset(prev, 0, 16);
+        while (c.valid()) {
+            if (memcmp(c.key(), prev, 16) < 0) bad++;
+            memcpy(prev, c.key(), 16);
+            c.next();
+        }
+        printf("      Order check: %s\n", bad==0 ? "✅" : "❌");
+    }
+
+    // ─── Test 2: Structured 8B binary keys with shared prefixes ───
+    {
+        FT2W m(0);
+        printf("  [2] 1M structured 8B keys (256 groups × 3906 items)\n");
+        std::vector<uint8_t> keys(N * 8);
+        for (uint32_t i = 0; i < N; i++) {
+            uint32_t grp = __builtin_bswap32(i % 256);
+            uint32_t uid = __builtin_bswap32(i);
+            memcpy(&keys[i*8], &grp, 4);
+            memcpy(&keys[i*8+4], &uid, 4);
+        }
+        for (uint32_t i = N-1; i > 0; i--) {
+            uint32_t j = arc4random_uniform(i+1);
+            for (int b = 0; b < 8; b++) std::swap(keys[i*8+b], keys[j*8+b]);
+        }
+
+        auto t0 = std::chrono::high_resolution_clock::now();
+        for (uint32_t i = 0; i < N; i++) m.insert(&keys[i*8], 8, i);
+        auto t1 = std::chrono::high_resolution_clock::now();
+        printf("      Insert: %.1f ns/key, size=%llu\n", std::chrono::duration<double,std::nano>(t1-t0).count()/N, m.size());
+        // Verify data integrity via get
+        uint32_t get_ok = 0;
+        for (uint32_t i = 0; i < N; i++) { uint32_t v; if (m.get(&keys[i*8], 8, v)) get_ok++; }
+        printf("      Get check: %u/%u %s\n", get_ok, N, get_ok==N?"✅":"❌");
+
+        auto c = m.create_cursor();
+        auto t2 = std::chrono::high_resolution_clock::now();
+        c.seek_first(); uint32_t cnt = 0;
+        while(c.valid()) { cnt++; c.next(); }
+        auto t3 = std::chrono::high_resolution_clock::now();
+        printf("      Sort+Iter: %.1f ns/key (%u found)\n", std::chrono::duration<double,std::nano>(t3-t2).count()/cnt, cnt);
+
+        // Pure
+        t2 = std::chrono::high_resolution_clock::now();
+        c.seek_first(); cnt = 0;
+        while(c.valid()) { cnt++; c.next(); }
+        t3 = std::chrono::high_resolution_clock::now();
+        printf("      Pure Iter: %.1f ns/key\n", std::chrono::duration<double,std::nano>(t3-t2).count()/cnt);
+
+        // Prefix scan: find all items in group 42
+        uint32_t pfx_val = __builtin_bswap32(42);
+        t2 = std::chrono::high_resolution_clock::now();
+        c.seek_prefix((const uint8_t*)&pfx_val, 4);
+        cnt = 0;
+        while (c.valid() && c.has_prefix((const uint8_t*)&pfx_val, 4)) { cnt++; c.next(); }
+        t3 = std::chrono::high_resolution_clock::now();
+        printf("      Prefix scan (grp 42): %.3f ms, %u items\n",
+            std::chrono::duration<double,std::milli>(t3-t2).count(), cnt);
+
+        // seek_ge to middle
+        uint32_t seek_grp = __builtin_bswap32(128);
+        uint32_t seek_uid = __builtin_bswap32(500000);
+        uint8_t seek_key[8]; memcpy(seek_key, &seek_grp, 4); memcpy(seek_key+4, &seek_uid, 4);
+        t2 = std::chrono::high_resolution_clock::now();
+        for (int r = 0; r < 10000; r++) c.seek_ge(seek_key, 8);
+        t3 = std::chrono::high_resolution_clock::now();
+        printf("      seek_ge (10K calls): %.1f ns/call\n",
+            std::chrono::duration<double,std::nano>(t3-t2).count()/10000);
+
+        // Reverse
+        t2 = std::chrono::high_resolution_clock::now();
+        c.seek_last(); cnt = 0;
+        while(c.valid()) { cnt++; c.prev(); }
+        t3 = std::chrono::high_resolution_clock::now();
+        printf("      Reverse:   %.1f ns/key (%u found)\n", std::chrono::duration<double,std::nano>(t3-t2).count()/cnt, cnt);
+
+        m.stats();
+    }
+
+    // ─── Test 3: Deep fractal (same 4B prefix, forces spawn) ───
+    {
+        FT2W m(0);
+        uint32_t ND = 100000;
+        printf("  [3] 100K deep fractal keys (shared 4B prefix)\n");
+        for (uint32_t i = 0; i < ND; i++) {
+            uint8_t k[12];
+            memcpy(k, "DEEP", 4);
+            uint32_t be_i = __builtin_bswap32(i);
+            memcpy(k+4, &be_i, 4);
+            uint32_t be_i2 = __builtin_bswap32(i * 7);
+            memcpy(k+8, &be_i2, 4);
+            m.insert(k, 12, i);
+        }
+        auto c = m.create_cursor();
+        auto t2 = std::chrono::high_resolution_clock::now();
+        c.seek_first(); uint32_t cnt = 0;
+        while(c.valid()) { cnt++; c.next(); }
+        auto t3 = std::chrono::high_resolution_clock::now();
+        printf("      Sort+Iter: %.1f ns/key (%u found)\n", std::chrono::duration<double,std::nano>(t3-t2).count()/(cnt?cnt:1), cnt);
+
+        t2 = std::chrono::high_resolution_clock::now();
+        c.seek_first(); cnt = 0;
+        while(c.valid()) { cnt++; c.next(); }
+        t3 = std::chrono::high_resolution_clock::now();
+        printf("      Pure Iter: %.1f ns/key (%u found)\n", std::chrono::duration<double,std::nano>(t3-t2).count()/(cnt?cnt:1), cnt);
+
+        printf("      Count check: %s (expected %u)\n", cnt==ND?"✅":"❌", ND);
+        m.stats();
+    }
+
+    printf("  ───────────────────────────────\n\n");
 }
 
 int main() {
@@ -1613,6 +1735,8 @@ int main() {
     printf("  ────────────────────────────────────\n");
     printf("  EDGE CASES: %d/%d passed %s\n", pass, pass+fail,
         fail==0 ? "✅" : "❌");
+
+    bench_mega_cursor();
 
     return 0;
 }
