@@ -223,14 +223,15 @@ public:
 // ═══════════════════════════════════════════════════════════════
 //  FractalTag2 — 4-byte kf, zero CRC, key-byte tag, CAP=16
 // ═══════════════════════════════════════════════════════════════
-static FILE* dbg_log = nullptr;
-static void hex_key(FILE* f, const uint8_t* k, uint32_t kl) {
-  for (uint32_t i=0;i<kl;i++) fprintf(f,"%02x",k[i]);
+static FILE *dbg_log = nullptr;
+static void hex_key(FILE *f, const uint8_t *k, uint32_t kl) {
+  for (uint32_t i = 0; i < kl; i++)
+    fprintf(f, "%02x", k[i]);
 }
 
 class FractalTag2 {
   static constexpr uint32_t CAP = 32;
-  static constexpr uint32_t MAX_GD = 24;
+  static constexpr uint32_t CHILD_MAX_GD = 16;
 
   struct alignas(16) Group {
     uint8_t tags[32];     // 32B
@@ -251,8 +252,10 @@ class FractalTag2 {
   UArena &ua_;
   uintptr_t *dir_;
   uint32_t gd_, ds_sz_;
-  uint32_t shift_; // = 32 - gd_, for branchless di()
-  uint32_t disc_off_; // byte offset into key where this node routes
+  uint32_t shift_;     // = 32 - gd_, for branchless di()
+  uint32_t disc_off_;  // byte offset into key where this node routes
+  uint32_t max_gd_;    // per-node directory limit (root=24, children=8)
+  uint32_t ref_off_;   // arena slot of representative entry (for gap prefix verification)
   uint32_t first_idx_; // directory index in parent for cursor dedup
   uint32_t last_idx_;  // last directory index in parent for cursor dedup
   std::atomic<uint64_t>
@@ -349,17 +352,20 @@ class FractalTag2 {
       nd[2 * i] = dir_[i];
       nd[2 * i + 1] = dir_[i];
     }
-    // Update first_idx_/last_idx_ for all groups AND children (indices doubled)
+    // Update first_idx_/last_idx_ exactly once per unique contiguous block.
+    // Process only the start of each block to prevent cascading updates.
     for (uint32_t i = 0; i < ds_sz_; i++) {
-      uintptr_t slot = nd[2 * i];
-      if (is_child(slot)) {
-        FractalTag2 *child = get_child(slot);
-        if (child->first_idx_ == i) child->first_idx_ = 2 * i;
-        if (child->last_idx_ == i) child->last_idx_ = 2 * i + 1;
-      } else {
-        Group *g = get_group(slot);
-        if (g->first_idx_ == i) g->first_idx_ = 2 * i;
-        if (g->last_idx_ == i) g->last_idx_ = 2 * i + 1;
+      if (i == 0 || dir_[i] != dir_[i - 1]) {
+        uintptr_t slot = dir_[i];
+        if (is_child(slot)) {
+          FractalTag2 *child = get_child(slot);
+          child->first_idx_ = child->first_idx_ * 2;
+          child->last_idx_ = child->last_idx_ * 2 + 1;
+        } else {
+          Group *g = get_group(slot);
+          g->first_idx_ = g->first_idx_ * 2;
+          g->last_idx_ = g->last_idx_ * 2 + 1;
+        }
       }
     }
     dir_ = nd;
@@ -370,7 +376,7 @@ class FractalTag2 {
 
   // Compute LCP of all keys in group, starting from disc_off_
   // Returns byte position of first differing byte across all keys
-  // Sets min_kl_out to the shortest key length in the group
+  // Uses FULL KEYS from the arena — not limited to 4-byte kf
   uint32_t compute_lcp(Group *g, uint32_t &min_kl_out) const {
     uint32_t min_kl = UINT32_MAX;
     for (uint32_t i = 0; i < g->count; i++) {
@@ -378,66 +384,43 @@ class FractalTag2 {
       if (skl < min_kl) min_kl = skl;
     }
     min_kl_out = min_kl;
-    // Start scanning from disc_off_ — find the first byte where ANY two keys differ
-    uint32_t lcp = disc_off_;
-    if (g->count > 1 && lcp < min_kl) {
-      const uint8_t *k0 = ua_.rec_key(entry_off(g->entries[0]));
-      uint32_t common_end = min_kl;
-      for (uint32_t i = 1; i < g->count; i++) {
-        const uint8_t *ki = ua_.rec_key(entry_off(g->entries[i]));
-        uint32_t j = lcp;
-        while (j < common_end && k0[j] == ki[j]) j++;
-        common_end = j;
-        if (common_end <= lcp) break;
-      }
-      lcp = common_end;
+    if (g->count <= 1 || disc_off_ >= min_kl) return disc_off_;
+
+    const uint8_t *k0 = ua_.rec_key(entry_off(g->entries[0]));
+    uint32_t common_end = min_kl;
+    for (uint32_t i = 1; i < g->count; i++) {
+      const uint8_t *ki = ua_.rec_key(entry_off(g->entries[i]));
+      uint32_t j = disc_off_;
+      while (j < common_end && k0[j] == ki[j]) j++;
+      if (j < common_end) common_end = j;
+      if (common_end <= disc_off_) break;
     }
-    return lcp;
+    return common_end;
   }
 
   // Spawn child at LCP-computed disc_off — skips ALL shared prefix in one shot
-  // DEBUG: logs spawn details
   // Returns false if spawn is impossible (all keys identical up to min length)
-  bool spawn_child_lcp(uint32_t dx) {
+  // Patricia-compressed spawn: jumps directly to LCP (no max_skip cap).
+  // Full gap [disc_off_, child_disc_off_) verified via ref_off_ memcmp on insert.
+  bool spawn_child(uint32_t dx) {
     Group *old = get_group(dir_[dx]);
-    uint32_t shared_kf = entry_kf(old->entries[0]);
     uint8_t ld = old->local_depth;
 
     uint32_t min_kl = 0;
-    if (dbg_log && old->count >= 2) {
-      fprintf(dbg_log, "  SPAWN_PRE: disc_off=%u count=%u ld=%u\n", disc_off_, old->count, ld);
-      for (uint32_t i = 0; i < 10 && i < old->count; i++) {
-        uint32_t off = entry_off(old->entries[i]);
-        uint16_t skl = ua_.rec_kl(off);
-        const uint8_t *fk = ua_.rec_key(off);
-        fprintf(dbg_log, "    e[%u] off=%u kf=%08x kl=%u key=", i, off, entry_kf(old->entries[i]), skl);
-        hex_key(dbg_log, fk, skl); fprintf(dbg_log, "\n");
-      }
-    }
     uint32_t child_disc_off = compute_lcp(old, min_kl);
+    // No max_skip cap — gap is verified by ref_off_ memcmp
 
-    // Guard 1: child must advance past current disc_off
-    // If LCP returned disc_off_ (entries differ at byte disc_off_ itself
-    // but share the same 4-byte kf window), skip the entire kf window
-    if (child_disc_off <= disc_off_) {
-      child_disc_off = disc_off_ + 4;  // skip 4-byte kf window
-      if (child_disc_off >= min_kl) {
-        if (dbg_log) fprintf(dbg_log, "  SPAWN_BLOCKED: guard1 kf_skip=%u >= min_kl=%u\n", child_disc_off, min_kl);
-        return false;
-      }
-    }
-    // Guard 2: if LCP reaches or exceeds shortest key, keys are indistinguishable
-    if (child_disc_off >= min_kl) {
-      if (dbg_log) fprintf(dbg_log, "  SPAWN_BLOCKED: guard2 child_disc_off=%u >= min_kl=%u\n", child_disc_off, min_kl);
+    // Guard: child must advance past current disc_off
+    if (child_disc_off <= disc_off_)
       return false;
-    }
+    // Guard: if LCP reaches or exceeds shortest key, keys are indistinguishable
+    if (child_disc_off >= min_kl)
+      return false;
 
-    if (dbg_log) fprintf(dbg_log, "  SPAWN: disc_off=%u->%u count=%u min_kl=%u\n", disc_off_, child_disc_off, old->count, min_kl);
     auto *child = (FractalTag2 *)ua_.alloc(sizeof(FractalTag2));
-    new (child) FractalTag2(ua_, count_, child_disc_off);
+    new (child) FractalTag2(ua_, count_, child_disc_off, CHILD_MAX_GD);
 
     // Re-insert entries via child's insert_internal (reuses arena offsets)
-    // Safe from infinite loop thanks to forward-progress guard + dx-based stride
     count_->fetch_sub(old->count, std::memory_order_relaxed);
     for (uint32_t i = 0; i < old->count; i++) {
       uint32_t off = entry_off(old->entries[i]);
@@ -447,8 +430,10 @@ class FractalTag2 {
       child->insert_internal(full_key, stored_kl, val, off);
     }
 
+    // Store arena offset of first entry as reference for gap verification
+    child->ref_off_ = entry_off(old->entries[0]);
     uint32_t stride = 1u << (gd_ - ld);
-    uint32_t st = dx & ~(stride - 1);  // use dx, NOT di(shared_kf)!
+    uint32_t st = dx & ~(stride - 1);
     child->first_idx_ = st;
     child->last_idx_ = st + stride - 1;
     for (uint32_t i = st; i < st + stride; i++)
@@ -458,7 +443,12 @@ class FractalTag2 {
 
   // Returns false if bucket can't be split (keys are indistinguishable)
   bool split_or_spawn(uint32_t dx) {
-    if (dbg_log) fprintf(dbg_log, "  SPLIT_OR_SPAWN: node=%p disc_off=%u dx=%u gd=%u slot_is_child=%d count=%u\n", (void*)this, disc_off_, dx, gd_, is_child(dir_[dx]), is_child(dir_[dx]) ? 0 : get_group(dir_[dx])->count);
+    if (dbg_log)
+      fprintf(dbg_log,
+              "  SPLIT_OR_SPAWN: node=%p disc_off=%u dx=%u gd=%u "
+              "slot_is_child=%d count=%u\n",
+              (void *)this, disc_off_, dx, gd_, is_child(dir_[dx]),
+              is_child(dir_[dx]) ? 0 : get_group(dir_[dx])->count);
     Group *old = get_group(dir_[dx]);
     uint8_t ld = old->local_depth;
 
@@ -470,13 +460,14 @@ class FractalTag2 {
     if (ld > 0)
       diff &= ((1u << (32 - ld)) - 1);
 
+    // When diff==0, all entries have identical kf. Spawn child immediately.
     if (diff == 0) {
-      return spawn_child_lcp(dx);
+      return spawn_child(dx);
     }
 
-    uint8_t split_ld = (uint8_t)__builtin_clz(diff);
-    if (split_ld >= MAX_GD) {
-      return spawn_child_lcp(dx);
+    uint8_t split_ld = ld;
+    if (split_ld >= max_gd_) {
+      return spawn_child(dx);
     }
     while (split_ld >= gd_) {
       double_dir();
@@ -496,31 +487,25 @@ class FractalTag2 {
 
     uint32_t old_stride = 1u << (gd_ - ld);
     uint32_t st = dx & ~(old_stride - 1);
-    bool g0_first_set = false, g1_first_set = false;
-    uint32_t g0_last = 0, g1_last = 0;
-    for (uint32_t i = st; i < st + old_stride; i++) {
-      uint8_t side = (i >> (gd_ - 1 - split_ld)) & 1;
-      if (side) {
-        dir_[i] = (uintptr_t)g1;
-        if (!g1_first_set) { g1->first_idx_ = i; g1_first_set = true; }
-        g1_last = i;
-      } else {
-        dir_[i] = (uintptr_t)g0;
-        if (!g0_first_set) { g0->first_idx_ = i; g0_first_set = true; }
-        g0_last = i;
-      }
+    uint32_t half_stride = old_stride / 2;
+    for (uint32_t i = 0; i < half_stride; i++) {
+      dir_[st + i] = (uintptr_t)g0;
+      dir_[st + half_stride + i] = (uintptr_t)g1;
     }
-    g0->last_idx_ = g0_last;
-    g1->last_idx_ = g1_last;
+    g0->first_idx_ = st;
+    g0->last_idx_ = st + half_stride - 1;
+    g1->first_idx_ = st + half_stride;
+    g1->last_idx_ = st + old_stride - 1;
     g0->sorted = 0;
     g1->sorted = 0;
     return true;
   }
 
 public:
-  FractalTag2(UArena &ua, std::atomic<uint64_t> *cnt, uint32_t disc_off = 0)
-      : ua_(ua), count_(cnt), disc_off_(disc_off),
-        first_idx_(0), last_idx_(0) {
+  FractalTag2(UArena &ua, std::atomic<uint64_t> *cnt, uint32_t disc_off = 0,
+              uint32_t max_gd = 24)
+      : ua_(ua), count_(cnt), disc_off_(disc_off), max_gd_(max_gd),
+        ref_off_(0xFFFFFFFF), first_idx_(0), last_idx_(0) {
     gd_ = 0;
     ds_sz_ = 1;
     shift_ = 32;
@@ -535,15 +520,125 @@ public:
     uint32_t kf;
     uint8_t tag;
     node->extract_at(k, kl, kf, tag);
-    if (dbg_log) { fprintf(dbg_log, "INSERT key="); hex_key(dbg_log,k,kl); fprintf(dbg_log, " v=%u disc_off=%u kf=%08x tag=%02x\n", v, node->disc_off_, kf, tag); }
+    if (dbg_log) {
+      fprintf(dbg_log, "INSERT key=");
+      hex_key(dbg_log, k, kl);
+      fprintf(dbg_log, " v=%u disc_off=%u kf=%08x tag=%02x\n", v,
+              node->disc_off_, kf, tag);
+    }
 
     for (int a = 0; a < 256; a++) {
       uint32_t dx = node->di(kf);
       uintptr_t slot = node->dir_[dx];
       if (is_child(slot)) {
-        node = get_child(slot);
+        FractalTag2 *child = get_child(slot);
+        // Patricia gap verification: verify ALL bytes in
+        // [node->disc_off_, child->disc_off_) match the reference entry.
+        uint32_t gap_start = node->disc_off_;
+        uint32_t gap_end = child->disc_off_;
+        if (gap_end > gap_start) {
+          const uint8_t *ref_key = node->ua_.rec_key(child->ref_off_);
+          uint16_t ref_kl = node->ua_.rec_kl(child->ref_off_);
+          uint32_t check_end = gap_end;
+          if (check_end > kl) check_end = kl;
+          if (check_end > ref_kl) check_end = ref_kl;
+          // Find first diverging byte in the gap
+          uint32_t div_byte = gap_start;
+          while (div_byte < check_end && k[div_byte] == ref_key[div_byte])
+            div_byte++;
+          if (div_byte < gap_end) {
+            // GAP MISMATCH at div_byte → Patricia edge split.
+            // Create intermediate branch node at the divergence point.
+            auto *branch = (FractalTag2 *)node->ua_.alloc(sizeof(FractalTag2));
+            new (branch) FractalTag2(node->ua_, node->count_, div_byte, CHILD_MAX_GD);
+            branch->ref_off_ = child->ref_off_; // same ref, gap [parent, div_byte) is subset
+
+            // Compute kf at div_byte for ref and new key
+            uint32_t ref_kf_at_div, new_kf_at_div;
+            uint8_t ref_tag_at_div, new_tag_at_div;
+            branch->extract_at(ref_key, ref_kl, ref_kf_at_div, ref_tag_at_div);
+            branch->extract_at(k, kl, new_kf_at_div, new_tag_at_div);
+
+            // They must differ (we diverged at div_byte)
+            uint32_t xor_bits = ref_kf_at_div ^ new_kf_at_div;
+            if (xor_bits == 0) {
+              // Edge case: keys differ in length but not in kf at div_byte.
+              // The short key ends here — just insert at branch level.
+            } else {
+              uint8_t split_bit = __builtin_clz(xor_bits);
+              // Grow branch directory until kfs are separated
+              while (branch->gd_ <= split_bit)
+                branch->double_dir();
+            }
+
+            // Install old child on ref_kf side of branch directory
+            uint32_t child_dx_in_branch = branch->di(ref_kf_at_div);
+            uint32_t new_dx_in_branch = branch->di(new_kf_at_div);
+
+            // Find the initial group that spans the branch directory
+            Group *init_group = get_group(branch->dir_[new_dx_in_branch]);
+
+            // Compute stride for each side: child gets ref_kf slots, group gets new_kf slots.
+            // After double_dir, all slots point to init_group. Overwrite child's slots.
+            // With gd_ = split_bit+1, the child's stride = 1 (exactly 1 slot matches
+            // each distinct kf pattern at the split resolution). But the child needs
+            // ALL slots with the same top (split_bit+1) bits as ref_kf.
+            // stride = ds_sz_ / (1 << (split_bit + 1)) = 1 (since gd_ = split_bit+1)
+            if (child_dx_in_branch != new_dx_in_branch) {
+              // Child occupies exactly 1 slot (stride=1 when gd_ = split_bit+1)
+              child->first_idx_ = child_dx_in_branch;
+              child->last_idx_ = child_dx_in_branch;
+              branch->dir_[child_dx_in_branch] = tag_child(child);
+              // Empty group keeps all other slots
+              init_group->first_idx_ = 0;
+              init_group->last_idx_ = branch->ds_sz_ - 1;
+              // But fix: init_group shouldn't include child's slot in cursor dedup.
+              // Use the next adjacent slot as first_idx if child is at 0.
+              if (child_dx_in_branch == 0) {
+                init_group->first_idx_ = 1;
+              } else if (child_dx_in_branch == branch->ds_sz_ - 1) {
+                init_group->last_idx_ = branch->ds_sz_ - 2;
+              }
+              // Note: init_group spans non-contiguous slots but first/last covers
+              // all of them for cursor dedup. The cursor uses canonical first/last checks.
+            } else {
+              // Same slot — child goes into the single slot, group needs a new slot
+              // This happens when xor_bits was 0 (gd stayed 0). Put child at slot 0.
+              child->first_idx_ = 0;
+              child->last_idx_ = 0;
+              branch->dir_[0] = tag_child(child);
+              // The new key can't descend into child, insert will retry and
+              // split_or_spawn will separate them.
+            }
+
+            // Replace old child in parent directory with branch
+            uint32_t parent_fi = child->first_idx_;
+            uint32_t parent_li = child->last_idx_;
+            // Reclaim the original parent slots that pointed to old child
+            // We need to re-read them since child's first/last just changed
+            // Use the saved values from before we modified them
+            // Actually — the parent slots are what we need to overwrite.
+            // Find them from dx: the child occupied some contiguous range.
+            // Walk left/right from dx to find the extent.
+            uint32_t p_start = dx, p_end = dx;
+            while (p_start > 0 && node->dir_[p_start - 1] == slot)
+              p_start--;
+            while (p_end + 1 < node->ds_sz_ && node->dir_[p_end + 1] == slot)
+              p_end++;
+            branch->first_idx_ = p_start;
+            branch->last_idx_ = p_end;
+            for (uint32_t i = p_start; i <= p_end; i++)
+              node->dir_[i] = tag_child(branch);
+
+            continue; // retry — new key will find branch, then its group
+          }
+        }
+        // Gap verified — descend into child
+        node = child;
         node->extract_at(k, kl, kf, tag);
-        if (dbg_log) fprintf(dbg_log, "  DESCEND child disc_off=%u kf=%08x tag=%02x\n", node->disc_off_, kf, tag);
+        if (dbg_log)
+          fprintf(dbg_log, "  DESCEND child disc_off=%u kf=%08x tag=%02x\n",
+                  node->disc_off_, kf, tag);
         continue;
       }
       Group *g = get_group(slot);
@@ -552,7 +647,13 @@ public:
         int p = __builtin_ctz(mm);
         if (entry_kf(g->entries[p]) == kf &&
             node->key_eq(entry_off(g->entries[p]), k, kl)) {
-          if (dbg_log) { fprintf(dbg_log, "  DUP found at p=%d off=%u stored_key=", p, entry_off(g->entries[p])); hex_key(dbg_log, node->ua_.rec_key(entry_off(g->entries[p])), node->ua_.rec_kl(entry_off(g->entries[p]))); fprintf(dbg_log, "\n"); }
+          if (dbg_log) {
+            fprintf(dbg_log, "  DUP found at p=%d off=%u stored_key=", p,
+                    entry_off(g->entries[p]));
+            hex_key(dbg_log, node->ua_.rec_key(entry_off(g->entries[p])),
+                    node->ua_.rec_kl(entry_off(g->entries[p])));
+            fprintf(dbg_log, "\n");
+          }
           node->ua_.rec_set_val(entry_off(g->entries[p]), v);
           return false;
         }
@@ -601,7 +702,31 @@ public:
     for (int guard = 0; guard < 64; guard++) {
       uintptr_t slot = node->dir_[node->di(kf)];
       if (is_child(slot)) {
-        node = get_child(slot);
+        FractalTag2 *child = get_child(slot);
+        // Patricia gap verification
+        uint32_t gap_start = node->disc_off_;
+        uint32_t gap_end = child->disc_off_;
+        if (gap_end > gap_start) {
+          const uint8_t *ref_key = node->ua_.rec_key(child->ref_off_);
+          uint16_t ref_kl = node->ua_.rec_kl(child->ref_off_);
+          uint32_t check_end = gap_end;
+          if (check_end > kl) check_end = kl;
+          if (check_end > ref_kl) check_end = ref_kl;
+          if (check_end < gap_end ||
+              memcmp(k + gap_start, ref_key + gap_start, gap_end - gap_start) != 0) {
+            if (dbg_log) {
+              fprintf(dbg_log, "GET GAP MISS: disc_off=%u gap=[%u,%u) check_end=%u kl=%u ref_kl=%u\n",
+                      node->disc_off_, gap_start, gap_end, check_end, kl, ref_kl);
+              fprintf(dbg_log, "  key bytes: ");
+              for (uint32_t b = gap_start; b < gap_end && b < kl; b++) fprintf(dbg_log, "%02x ", k[b]);
+              fprintf(dbg_log, "\n  ref bytes: ");
+              for (uint32_t b = gap_start; b < gap_end && b < ref_kl; b++) fprintf(dbg_log, "%02x ", ref_key[b]);
+              fprintf(dbg_log, "\n");
+            }
+            return false; // gap mismatch — key not here
+          }
+        }
+        node = child;
         node->extract_at(k, kl, kf, tag);
         continue;
       }
@@ -639,7 +764,21 @@ public:
       uint32_t dx = node->di(kf);
       uintptr_t slot = node->dir_[dx];
       if (is_child(slot)) {
-        node = get_child(slot);
+        FractalTag2 *child = get_child(slot);
+        // Patricia gap verification
+        uint32_t gap_start = node->disc_off_;
+        uint32_t gap_end = child->disc_off_;
+        if (gap_end > gap_start) {
+          const uint8_t *ref_key = node->ua_.rec_key(child->ref_off_);
+          uint16_t ref_kl = node->ua_.rec_kl(child->ref_off_);
+          uint32_t check_end = gap_end;
+          if (check_end > kl) check_end = kl;
+          if (check_end > ref_kl) check_end = ref_kl;
+          if (check_end < gap_end ||
+              memcmp(k + gap_start, ref_key + gap_start, gap_end - gap_start) != 0)
+            return false; // gap mismatch — key not here
+        }
+        node = child;
         node->extract_at(k, kl, kf, tag);
         continue;
       }
@@ -760,11 +899,11 @@ public:
     // O(1) dedup via first_idx_/last_idx_ stored on each group/child
     static uint32_t get_first_idx(uintptr_t slot) {
       return is_child(slot) ? get_child(slot)->first_idx_
-                           : get_group(slot)->first_idx_;
+                            : get_group(slot)->first_idx_;
     }
     static uint32_t get_last_idx(uintptr_t slot) {
       return is_child(slot) ? get_child(slot)->last_idx_
-                           : get_group(slot)->last_idx_;
+                            : get_group(slot)->last_idx_;
     }
 
     void set_leaf() {
@@ -840,6 +979,7 @@ public:
           f.group_idx = -1;
         }
         // Scan directory backwards
+        bool pushed_child = false;
         while (true) {
           if (f.dir_idx == 0 && f.group_idx < 0)
             break;
@@ -854,6 +994,7 @@ public:
           if (is_child(slot)) {
             FractalTag2 *child = get_child(slot);
             push_at(child, child->ds_sz_);
+            pushed_child = true;
             break;
           }
           Group *g = get_group(slot);
@@ -866,7 +1007,7 @@ public:
           if (f.dir_idx == 0)
             break;
         }
-        if (f.group_idx < 0) {
+        if (!pushed_child && f.group_idx < 0) {
           depth_--;
           if (depth_ >= 0) {
             stack_[depth_].group_idx = -1;
@@ -895,7 +1036,7 @@ public:
                     uint32_t full_kl) {
       uint32_t kf;
       uint8_t tag;
-      node->extract(full_key, full_kl, kf, tag);
+      node->extract_at(full_key, full_kl, kf, tag);
       uint32_t start = node->di(kf);
       push_at(node, start);
       auto &f = stack_[depth_];
@@ -1534,10 +1675,15 @@ static void bench_mega_cursor() {
       memcpy(k + 8, &be_i2, 4);
       m.insert(k, 12, i);
     }
-    if (dbg_log) { fclose(dbg_log); dbg_log = nullptr; }
-    printf("      Inserted: size=%llu (expect %u) arena=%.1fMB\n", m.size(), ND, m.used()/(1024.0*1024.0));
+    if (dbg_log) {
+      fclose(dbg_log);
+      dbg_log = nullptr;
+    }
+    printf("      Inserted: size=%llu (expect %u) arena=%.1fMB\n", m.size(), ND,
+           m.used() / (1024.0 * 1024.0));
     // Verify every key
-    uint32_t ok=0, bad=0, miss=0;
+    dbg_log = fopen("get_log.txt", "w");
+    uint32_t ok = 0, bad = 0, miss = 0;
     for (uint32_t i = 0; i < ND; i++) {
       uint8_t k[12];
       memcpy(k, "DEEP", 4);
@@ -1547,26 +1693,51 @@ static void bench_mega_cursor() {
       memcpy(k + 8, &be_i2, 4);
       uint32_t v;
       if (m.get(k, 12, v)) {
-        if (v == i) ok++; else { bad++; if (bad<=5) printf("      BAD: i=%u got v=%u\n", i, v); }
+        if (v == i)
+          ok++;
+        else {
+          bad++;
+          if (bad <= 5)
+            printf("      BAD: i=%u got v=%u\n", i, v);
+        }
       } else {
-        miss++; if (miss<=5) printf("      MISS: i=%u\n", i);
+        miss++;
+        if (miss <= 5)
+          printf("      MISS: i=%u\n", i);
       }
     }
-    printf("      Verify: ok=%u bad=%u miss=%u %s\n", ok, bad, miss, (ok==ND)?"✅":"❌");
+    printf("      Verify: ok=%u bad=%u miss=%u %s\n", ok, bad, miss,
+           (ok == ND) ? "✅" : "❌");
+    if (dbg_log) { fclose(dbg_log); dbg_log = nullptr; }
     auto c = m.create_cursor();
     auto t2 = std::chrono::high_resolution_clock::now();
-    c.seek_first(); uint32_t cnt = 0;
-    while(c.valid()) { cnt++; c.next(); }
+    c.seek_first();
+    uint32_t cnt = 0;
+    while (c.valid()) {
+      cnt++;
+      c.next();
+    }
     auto t3 = std::chrono::high_resolution_clock::now();
-    printf("      Sort+Iter: %.1f ns/key (%u found)\n", std::chrono::duration<double,std::nano>(t3-t2).count()/(cnt?cnt:1), cnt);
+    printf("      Sort+Iter: %.1f ns/key (%u found)\n",
+           std::chrono::duration<double, std::nano>(t3 - t2).count() /
+               (cnt ? cnt : 1),
+           cnt);
 
     t2 = std::chrono::high_resolution_clock::now();
-    c.seek_first(); cnt = 0;
-    while(c.valid()) { cnt++; c.next(); }
+    c.seek_first();
+    cnt = 0;
+    while (c.valid()) {
+      cnt++;
+      c.next();
+    }
     t3 = std::chrono::high_resolution_clock::now();
-    printf("      Pure Iter: %.1f ns/key (%u found)\n", std::chrono::duration<double,std::nano>(t3-t2).count()/(cnt?cnt:1), cnt);
+    printf("      Pure Iter: %.1f ns/key (%u found)\n",
+           std::chrono::duration<double, std::nano>(t3 - t2).count() /
+               (cnt ? cnt : 1),
+           cnt);
 
-    printf("      Count check: %s (expected %u)\n", cnt==ND?"✅":"❌", ND);
+    printf("      Count check: %s (expected %u)\n", cnt == ND ? "✅" : "❌",
+           ND);
     // m.stats(); // skipped for now
   }
 
@@ -1736,7 +1907,7 @@ int main() {
     }
     printf("  %uK, %uB, %u pfx: Found:%u/%u %s\n", N / 1000, kl, n_pfx, found,
            N, found == N ? "✅" : "❌");
-    m.stats();
+    // m.stats();
   };
   run_patho(10000, 32, 1);
   run_patho(50000, 32, 4);
@@ -2368,6 +2539,8 @@ int main() {
     // Forward: verify sorted order + count/sum
     auto c = m.create_cursor();
     c.seek_first();
+    printf("  T22 cursor order:\n");
+
     int fwd_count = 0;
     uint32_t fwd_sum = 0;
     uint8_t prev_key[256] = {0};
@@ -2375,6 +2548,9 @@ int main() {
     do {
       uint32_t kl = c.key_len();
       const uint8_t *k = c.key();
+      printf("    [%d] kl=%u key=", fwd_count, kl);
+      for (uint32_t b = 0; b < kl && b < 16; b++) printf("%02x", k[b]);
+      printf(" val=%u\n", c.val());
       if (fwd_count > 0) {
         uint32_t mkl = prev_kl < kl ? prev_kl : kl;
         int cmp = memcmp(k, prev_key, mkl);
